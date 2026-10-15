@@ -6,7 +6,7 @@
 
 ```bash
 python3 -m unittest discover -s tests -v
-python3 -m py_compile spectra_app.py gaussian_parser.py
+python3 -m py_compile spectra_app.py gaussian_parser.py experimental_parser.py spectrum_processing.py
 QT_QPA_PLATFORM=offscreen python3 spectra_app.py --smoke-test
 ```
 
@@ -32,3 +32,5 @@ QT_QPA_PLATFORM=offscreen python3 spectra_app.py --smoke-test
 3. Укажите `water.log`.
 4. Убедитесь, что таблица содержит 48 строк, а статус показывает имя файла и число мод.
 5. Переключите Raman/ИК: кривая должна перестроиться, а значения в таблице остаться неизменными.
+6. Измените контур, ширину пика, масштаб частот и направление X: отображение должно обновляться без повторного импорта.
+7. Импортируйте двухколоночный `.csv`, `.txt` или `.xy`: в графике должны появиться исходная кривая, baseline и скорректированный результат.

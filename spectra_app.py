@@ -3,40 +3,27 @@
 from __future__ import annotations
 
 import argparse
-import math
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QEasingCurve, QPropertyAnimation, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QLinearGradient, QPainter, QPainterPath, QPen
+import numpy as np
+from PySide6.QtCore import QRectF, Qt, Signal
+from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
-    QApplication,
-    QButtonGroup,
-    QComboBox,
-    QFrame,
-    QFileDialog,
-    QGraphicsOpacityEffect,
-    QGroupBox,
-    QHeaderView,
-    QHBoxLayout,
-    QLabel,
-    QMainWindow,
-    QMessageBox,
-    QPushButton,
-    QRadioButton,
-    QSlider,
-    QSpinBox,
-    QSplitter,
-    QTableWidget,
-    QTableWidgetItem,
-    QVBoxLayout,
-    QWidget,
+    QApplication, QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox,
+    QFileDialog, QFormLayout, QFrame, QGroupBox, QHeaderView, QHBoxLayout,
+    QLabel, QMainWindow, QMessageBox, QPushButton, QRadioButton,
+    QScrollArea, QSpinBox, QSplitter, QTableWidget, QTableWidgetItem,
+    QVBoxLayout, QWidget,
 )
 
+from experimental_parser import ExperimentalImportError, ExperimentalSpectrum, parse_experimental_file
 from gaussian_parser import GaussianCalculation, GaussianImportError, VibrationalMode, parse_gaussian_log
+from spectrum_processing import BaselineResult, TheoreticalSettings, calculate_theoretical_spectrum, estimate_baseline
+
 
 class SpectrumPreview(QWidget):
-    """Lightweight interactive preview of a calculated spectrum."""
+    """Draw theoretical and experimental spectra in a shared scientific plot."""
 
     peak_selected = Signal(int)
 
@@ -44,78 +31,116 @@ class SpectrumPreview(QWidget):
         super().__init__()
         self.setMinimumHeight(330)
         self.setMouseTracking(True)
-        self._mode = "raman"
-        self._profile = "Гауссовский"
-        self._width = 18.0
-        self._selected = 0
         self._modes: list[VibrationalMode] = []
+        self._experimental: ExperimentalSpectrum | None = None
+        self._baseline: BaselineResult | None = None
+        self._kind = "raman"
+        self._settings = TheoreticalSettings()
         self._x_min, self._x_max = 0.0, 4000.0
+        self._reverse_x = False
+        self._selected = 0
+
+    def configure(self, kind: str, settings: TheoreticalSettings, x_min: float, x_max: float, reverse_x: bool) -> None:
+        self._kind, self._settings = kind, settings
+        self._x_min, self._x_max, self._reverse_x = x_min, x_max, reverse_x
+        self.update()
 
     def set_modes(self, modes: list[VibrationalMode]) -> None:
         self._modes = modes
         self._selected = min(self._selected, len(modes) - 1) if modes else 0
         self.update()
 
-    def set_spectrum_kind(self, kind: str) -> None:
-        self._mode = kind
+    def set_experimental(self, spectrum: ExperimentalSpectrum | None) -> None:
+        self._experimental = spectrum
         self.update()
 
-    def set_profile(self, profile: str) -> None:
-        self._profile = profile
-        self.update()
-
-    def set_width_value(self, width: int) -> None:
-        self._width = float(width)
+    def set_baseline(self, result: BaselineResult | None) -> None:
+        self._baseline = result
         self.update()
 
     def select_peak(self, row: int) -> None:
-        self._selected = row
+        if self._modes:
+            self._selected = max(0, min(row, len(self._modes) - 1))
         self.update()
 
-    def _intensity(self, mode: VibrationalMode) -> float:
-        return mode.raman_activity if self._mode == "raman" else mode.ir_intensity
+    def _map_x(self, value: np.ndarray | float, plot: QRectF) -> np.ndarray | float:
+        fraction = (np.asarray(value) - self._x_min) / (self._x_max - self._x_min)
+        if self._reverse_x:
+            fraction = 1.0 - fraction
+        result = plot.left() + fraction * plot.width()
+        return float(result) if np.ndim(result) == 0 else result
 
-    def _value_at(self, x: float, maximum: float) -> float:
-        total = 0.0
-        for mode in self._modes:
-            amplitude = self._intensity(mode) / maximum
-            dx = (x - mode.frequency) / self._width
-            if self._profile == "Лоренцевский":
-                total += amplitude / (1.0 + dx * dx)
-            elif self._profile == "Voigt":
-                total += amplitude * (0.55 * math.exp(-0.5 * dx * dx) + 0.45 / (1.0 + dx * dx))
-            else:
-                total += amplitude * math.exp(-0.5 * dx * dx)
-        return total
+    @staticmethod
+    def _path(xs: np.ndarray, ys: np.ndarray) -> QPainterPath:
+        path = QPainterPath()
+        if len(xs):
+            path.moveTo(float(xs[0]), float(ys[0]))
+            for x, y in zip(xs[1:], ys[1:]):
+                path.lineTo(float(x), float(y))
+        return path
 
-    def paintEvent(self, event) -> None:  # noqa: N802 - Qt API
+    def _draw_legend(self, painter: QPainter, plot: QRectF, has_experimental: bool) -> None:
+        entries = [("Расчёт", QColor("#1f5b8c"), Qt.PenStyle.SolidLine)]
+        if has_experimental:
+            entries += [
+                ("Эксперимент", QColor("#606060"), Qt.PenStyle.SolidLine),
+                ("Baseline", QColor("#a35a22"), Qt.PenStyle.DashLine),
+                ("После коррекции", QColor("#7a2830"), Qt.PenStyle.SolidLine),
+            ]
+        painter.setFont(QFont("Arial", 8))
+        x, y = plot.right() - 142, plot.top() + 12
+        for label, color, style in entries:
+            painter.setPen(QPen(color, 1.4, style))
+            painter.drawLine(x, y, x + 16, y)
+            painter.setPen(QColor("#303030"))
+            painter.drawText(x + 21, y + 3, label)
+            y += 14
+
+    def _draw_experimental(self, painter: QPainter, plot: QRectF) -> None:
+        if self._experimental is None:
+            return
+        x, raw = self._experimental.x, self._experimental.y
+        baseline = self._baseline.baseline if self._baseline is not None else None
+        corrected = self._baseline.corrected if self._baseline is not None else None
+        arrays = [raw] + ([baseline, corrected] if baseline is not None and corrected is not None else [])
+        scale = max(float(np.max(np.abs(values))) for values in arrays) or 1.0
+        inside = (x >= self._x_min) & (x <= self._x_max)
+        if not np.any(inside):
+            return
+        xs = self._map_x(x[inside], plot)
+        y_bottom, height = plot.bottom(), plot.height() * 0.84
+        painter.setClipRect(plot)
+        painter.setPen(QPen(QColor("#6a6a6a"), 1.0))
+        painter.drawPath(self._path(xs, y_bottom - raw[inside] / scale * height))
+        if baseline is not None and corrected is not None:
+            painter.setPen(QPen(QColor("#a35a22"), 1.0, Qt.PenStyle.DashLine))
+            painter.drawPath(self._path(xs, y_bottom - baseline[inside] / scale * height))
+            painter.setPen(QPen(QColor("#7a2830"), 1.2))
+            painter.drawPath(self._path(xs, y_bottom - corrected[inside] / scale * height))
+        painter.setClipping(False)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.fillRect(self.rect(), QColor("#ffffff"))
-
         plot = QRectF(72, 28, self.width() - 104, self.height() - 86)
-        if plot.width() <= 0 or plot.height() <= 0:
+        if plot.width() <= 0 or plot.height() <= 0 or self._x_max <= self._x_min:
             return
 
-        grid_pen = QPen(QColor("#d9d9d9"), 1)
-        painter.setPen(grid_pen)
+        painter.setPen(QPen(QColor("#d9d9d9"), 1))
         for index in range(5):
-            y = plot.top() + index * plot.height() / 4
-            painter.drawLine(plot.left(), y, plot.right(), y)
-        for index in range(5):
-            x = plot.left() + index * plot.width() / 4
+            painter.drawLine(plot.left(), plot.top() + index * plot.height() / 4, plot.right(), plot.top() + index * plot.height() / 4)
+        for value in np.linspace(self._x_min, self._x_max, 5):
+            x = self._map_x(value, plot)
             painter.drawLine(x, plot.top(), x, plot.bottom())
-
-        painter.setPen(QPen(QColor("#727272"), 1.0))
+        painter.setPen(QPen(QColor("#727272"), 1))
         painter.drawLine(plot.left(), plot.bottom(), plot.right(), plot.bottom())
         painter.drawLine(plot.left(), plot.top(), plot.left(), plot.bottom())
-
-        tick_font = QFont("Inter", 9)
-        painter.setFont(tick_font)
+        painter.setFont(QFont("Arial", 9))
         painter.setPen(QColor("#4d4d4d"))
-        for value in range(0, 4001, 1000):
-            x = plot.left() + plot.width() * value / 4000
-            painter.drawText(QRectF(x - 24, plot.bottom() + 11, 48, 18), Qt.AlignmentFlag.AlignCenter, str(value))
+        for value in np.linspace(self._x_min, self._x_max, 5):
+            x = self._map_x(value, plot)
+            painter.drawText(QRectF(x - 28, plot.bottom() + 11, 56, 18), Qt.AlignmentFlag.AlignCenter, f"{value:.0f}")
         painter.drawText(QRectF(plot.left(), plot.bottom() + 36, plot.width(), 18), Qt.AlignmentFlag.AlignCenter, "Волновое число, см⁻¹")
         painter.save()
         painter.translate(18, plot.center().y())
@@ -123,54 +148,42 @@ class SpectrumPreview(QWidget):
         painter.drawText(QRectF(-plot.height() / 2, -10, plot.height(), 18), Qt.AlignmentFlag.AlignCenter, "Относительная интенсивность")
         painter.restore()
 
-        if not self._modes:
-            return
-        maximum = max(self._intensity(mode) for mode in self._modes)
-        path = QPainterPath()
-        steps = max(300, int(plot.width() * 1.6))
-        for index in range(steps):
-            x_value = self._x_min + (self._x_max - self._x_min) * index / (steps - 1)
-            y_value = min(1.06, self._value_at(x_value, maximum))
-            x = plot.left() + (x_value - self._x_min) * plot.width() / (self._x_max - self._x_min)
-            y = plot.bottom() - y_value * (plot.height() * 0.91)
-            if index == 0:
-                path.moveTo(x, y)
-            else:
-                path.lineTo(x, y)
+        self._draw_experimental(painter, plot)
+        if self._modes:
+            x_values, y_values = calculate_theoretical_spectrum(
+                self._modes, self._x_min, self._x_max, self._settings, self._kind, max(800, int(plot.width() * 1.8))
+            )
+            scale = float(np.max(np.abs(y_values))) or 1.0
+            xs = self._map_x(x_values, plot)
+            ys = plot.bottom() - y_values / scale * (plot.height() * 0.91)
+            painter.setClipRect(plot)
+            painter.setPen(QPen(QColor("#1f5b8c"), 1.8))
+            painter.drawPath(self._path(xs, ys))
+            painter.setClipping(False)
+            selected = self._modes[self._selected]
+            center = selected.frequency * self._settings.frequency_scale
+            if self._x_min <= center <= self._x_max:
+                x = self._map_x(center, plot)
+                index = int(np.argmin(np.abs(x_values - center)))
+                y = float(ys[index])
+                painter.setPen(QPen(QColor("#a53a2a"), 1.0, Qt.PenStyle.DashLine))
+                painter.drawLine(x, plot.top() + 4, x, plot.bottom())
+                painter.setBrush(QColor("#ffffff"))
+                painter.setPen(QPen(QColor("#a53a2a"), 1.5))
+                painter.drawEllipse(x - 4, y - 4, 8, 8)
+                painter.setPen(QColor("#8b3023"))
+                painter.drawText(QRectF(x + 8, max(plot.top() + 4, y - 25), 135, 18), f"{center:.1f} см⁻¹")
+        self._draw_legend(painter, plot, self._experimental is not None)
 
-        fill_path = QPainterPath(path)
-        fill_path.lineTo(plot.right(), plot.bottom())
-        fill_path.lineTo(plot.left(), plot.bottom())
-        fill_path.closeSubpath()
-        gradient = QLinearGradient(plot.left(), plot.top(), plot.right(), plot.bottom())
-        gradient.setColorAt(0, QColor(31, 91, 140, 22))
-        gradient.setColorAt(1, QColor(31, 91, 140, 2))
-        painter.fillPath(fill_path, gradient)
-        painter.setPen(QPen(QColor("#1f5b8c"), 1.8))
-        painter.drawPath(path)
-
-        selected_mode = self._modes[self._selected]
-        x = plot.left() + selected_mode.frequency / 4000 * plot.width()
-        y = plot.bottom() - min(1.06, self._value_at(selected_mode.frequency, maximum)) * (plot.height() * 0.91)
-        painter.setPen(QPen(QColor("#a53a2a"), 1.0, Qt.PenStyle.DashLine))
-        painter.drawLine(x, plot.top() + 4, x, plot.bottom())
-        painter.setBrush(QColor("#ffffff"))
-        painter.setPen(QPen(QColor("#a53a2a"), 1.5))
-        painter.drawEllipse(x - 4.5, y - 4.5, 9, 9)
-        painter.setPen(QColor("#8b3023"))
-        painter.setFont(QFont("Inter", 9, QFont.Weight.DemiBold))
-        painter.drawText(QRectF(x + 8, max(plot.top() + 4, y - 30), 130, 22), f"{selected_mode.frequency:.1f} см⁻¹")
-
-    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt API
-        if event.button() != Qt.MouseButton.LeftButton:
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() != Qt.MouseButton.LeftButton or not self._modes:
             return
-        plot_left, plot_width = 72, self.width() - 104
-        if plot_width <= 0:
-            return
-        frequency = (event.position().x() - plot_left) / plot_width * 4000
-        if not self._modes:
-            return
-        nearest = min(range(len(self._modes)), key=lambda i: abs(self._modes[i].frequency - frequency))
+        plot = QRectF(72, 28, self.width() - 104, self.height() - 86)
+        fraction = (event.position().x() - plot.left()) / plot.width()
+        if self._reverse_x:
+            fraction = 1.0 - fraction
+        frequency = self._x_min + fraction * (self._x_max - self._x_min)
+        nearest = min(range(len(self._modes)), key=lambda i: abs(self._modes[i].frequency * self._settings.frequency_scale - frequency))
         self.peak_selected.emit(nearest)
 
 
@@ -178,118 +191,153 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Gaussian Spectra")
-        self.resize(1460, 900)
+        self.resize(1500, 920)
         self.setMinimumSize(1120, 700)
         self.modes: list[VibrationalMode] = []
         self.calculation: GaussianCalculation | None = None
+        self.experimental: ExperimentalSpectrum | None = None
+        self.baseline: BaselineResult | None = None
         self.preview = SpectrumPreview()
-        self.table = QTableWidget(0, 4)
+        self.table = QTableWidget(0, 6)
         self._build_ui()
-        self._populate_table()
-        self._animate_workspace()
+        self._refresh_preview()
 
     def _build_ui(self) -> None:
         self._build_menu()
-        outer = QWidget()
-        outer.setObjectName("root")
+        outer = QWidget(objectName="root")
         self.setCentralWidget(outer)
         layout = QVBoxLayout(outer)
         layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(8)
-
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setObjectName("main_splitter")
         splitter.setChildrenCollapsible(False)
         splitter.addWidget(self._controls_panel())
         splitter.addWidget(self._work_area())
         splitter.addWidget(self._actions_panel())
-        splitter.setSizes([255, 930, 235])
+        splitter.setSizes([285, 925, 240])
         layout.addWidget(splitter, 1)
-
         self.statusBar().showMessage("Готово")
 
     def _build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("Файл")
         file_menu.addAction("Открыть Gaussian log…", self._open_gaussian_log)
-        save_action = file_menu.addAction("Сохранить проект…")
-        save_action.setEnabled(False)
+        file_menu.addAction("Импортировать экспериментальный спектр…", self._open_experimental)
         file_menu.addSeparator()
         file_menu.addAction("Выход", self.close)
-
         self.menuBar().addMenu("Спектр")
         view_menu = self.menuBar().addMenu("Вид")
         view_menu.addAction("Сбросить выделение", lambda: self._select_mode(0))
         self.menuBar().addMenu("Справка")
 
+    @staticmethod
+    def _double(value: float, low: float, high: float, decimals: int = 2) -> QDoubleSpinBox:
+        widget = QDoubleSpinBox()
+        widget.setRange(low, high)
+        widget.setDecimals(decimals)
+        widget.setValue(value)
+        return widget
+
     def _controls_panel(self) -> QWidget:
-        panel = QGroupBox("Построение спектра")
-        panel.setObjectName("panel")
-        panel.setMinimumWidth(220)
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(12, 18, 12, 12)
-        layout.setSpacing(9)
+        scroll = QScrollArea(objectName="control_scroll")
+        scroll.setWidgetResizable(True)
+        root = QWidget()
+        layout = QVBoxLayout(root)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(8)
 
-        spectrum_label = QLabel("ТИП СПЕКТРА")
-        spectrum_label.setObjectName("field_label")
-        layout.addWidget(spectrum_label)
-        raman = QRadioButton("Raman")
-        ir = QRadioButton("ИК")
-        raman.setChecked(True)
-        group = QButtonGroup(self)
-        group.addButton(raman)
-        group.addButton(ir)
-        raman.toggled.connect(lambda checked: checked and self.preview.set_spectrum_kind("raman"))
-        ir.toggled.connect(lambda checked: checked and self.preview.set_spectrum_kind("ir"))
-        layout.addWidget(raman)
-        layout.addWidget(ir)
+        spectrum_box = QGroupBox("Построение спектра")
+        spectrum_layout = QVBoxLayout(spectrum_box)
+        spectrum_layout.setContentsMargins(12, 18, 12, 12)
+        kind_row = QHBoxLayout()
+        self.raman_radio, self.ir_radio = QRadioButton("Raman"), QRadioButton("ИК")
+        self.raman_radio.setChecked(True)
+        kind_group = QButtonGroup(self)
+        kind_group.addButton(self.raman_radio)
+        kind_group.addButton(self.ir_radio)
+        self.raman_radio.toggled.connect(self._on_kind_changed)
+        self.ir_radio.toggled.connect(self._on_kind_changed)
+        kind_row.addWidget(self.raman_radio)
+        kind_row.addWidget(self.ir_radio)
+        kind_row.addStretch()
+        spectrum_layout.addLayout(kind_row)
+        form = QFormLayout()
+        self.profile_combo = QComboBox()
+        self.profile_combo.addItems(["Гауссовский", "Лоренцевский", "Voigt"])
+        self.profile_combo.currentTextChanged.connect(self._refresh_preview)
+        form.addRow("Контур", self.profile_combo)
+        self.width_spin = self._double(18.0, 1.0, 200.0, 1)
+        self.width_spin.setSuffix(" см⁻¹")
+        self.width_spin.valueChanged.connect(self._refresh_preview)
+        form.addRow("Ширина пика", self.width_spin)
+        self.scale_spin = self._double(1.0, 0.5, 1.5, 4)
+        self.scale_spin.valueChanged.connect(self._refresh_preview)
+        form.addRow("Масштаб частот", self.scale_spin)
+        self.normalization_combo = QComboBox()
+        self.normalization_combo.addItems(["Максимум = 1", "Максимум = 100", "Без нормировки"])
+        self.normalization_combo.currentTextChanged.connect(self._refresh_preview)
+        form.addRow("Нормализация", self.normalization_combo)
+        self.x_min_spin, self.x_max_spin = self._double(0.0, -1000.0, 50000.0, 1), self._double(4000.0, -999.0, 50000.0, 1)
+        self.x_min_spin.valueChanged.connect(self._refresh_preview)
+        self.x_max_spin.valueChanged.connect(self._refresh_preview)
+        form.addRow("От, см⁻¹", self.x_min_spin)
+        form.addRow("До, см⁻¹", self.x_max_spin)
+        self.reverse_axis = QCheckBox("Обратное направление оси X")
+        self.reverse_axis.toggled.connect(self._refresh_preview)
+        form.addRow(self.reverse_axis)
+        spectrum_layout.addLayout(form)
+        layout.addWidget(spectrum_box)
 
-        layout.addWidget(self._divider())
-        layout.addWidget(self._field_label("Контур"))
-        profile = QComboBox()
-        profile.addItems(["Гауссовский", "Лоренцевский", "Voigt"])
-        profile.currentTextChanged.connect(self.preview.set_profile)
-        layout.addWidget(profile)
-        layout.addWidget(self._field_label("Ширина пика · см⁻¹"))
-        self.width_value = QLabel("18")
-        self.width_value.setObjectName("control_value")
-        width_row = QHBoxLayout()
-        width = QSlider(Qt.Orientation.Horizontal)
-        width.setRange(5, 60)
-        width.setValue(18)
-        width.valueChanged.connect(lambda value: (self.width_value.setText(str(value)), self.preview.set_width_value(value)))
-        width_row.addWidget(width)
-        width_row.addWidget(self.width_value)
-        layout.addLayout(width_row)
+        self.raman_box = QGroupBox("Параметры Raman")
+        raman_form = QFormLayout(self.raman_box)
+        raman_form.setContentsMargins(12, 18, 12, 12)
+        self.laser_spin = self._double(514.5, 100.0, 5000.0, 1)
+        self.laser_spin.setSuffix(" нм")
+        self.laser_spin.valueChanged.connect(self._refresh_preview)
+        raman_form.addRow("Лазер", self.laser_spin)
+        self.temperature_spin = self._double(300.0, 10.0, 2000.0, 1)
+        self.temperature_spin.setSuffix(" K")
+        self.temperature_spin.valueChanged.connect(self._refresh_preview)
+        raman_form.addRow("Температура", self.temperature_spin)
+        self.polarization_combo = QComboBox()
+        self.polarization_combo.addItems(["Неполяризованный", "Параллельный", "Перпендикулярный"])
+        self.polarization_combo.currentTextChanged.connect(self._refresh_preview)
+        raman_form.addRow("Поляризация", self.polarization_combo)
+        layout.addWidget(self.raman_box)
 
-        layout.addWidget(self._divider())
-        layout.addWidget(self._field_label("Диапазон · см⁻¹"))
-        range_row = QHBoxLayout()
-        lower = QSpinBox()
-        lower.setRange(0, 3999)
-        lower.setValue(0)
-        upper = QSpinBox()
-        upper.setRange(1, 4000)
-        upper.setValue(4000)
-        range_row.addWidget(lower)
-        range_row.addWidget(QLabel("—"))
-        range_row.addWidget(upper)
-        layout.addLayout(range_row)
-        layout.addStretch(1)
-        hint = QLabel("Нажмите на пик на графике, чтобы выбрать соответствующую моду.")
-        hint.setObjectName("hint")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-        return panel
+        self.baseline_box = QGroupBox("Baseline-коррекция")
+        baseline_layout = QVBoxLayout(self.baseline_box)
+        baseline_layout.setContentsMargins(12, 18, 12, 12)
+        baseline_form = QFormLayout()
+        self.baseline_method = QComboBox()
+        self.baseline_method.addItems(["ALS", "airPLS", "Линейный", "Полином 2-й степени"])
+        baseline_form.addRow("Метод", self.baseline_method)
+        self.lambda_spin = QSpinBox()
+        self.lambda_spin.setRange(2, 9)
+        self.lambda_spin.setValue(6)
+        self.lambda_spin.setPrefix("10^")
+        baseline_form.addRow("λ", self.lambda_spin)
+        self.asymmetry_spin = self._double(0.01, 0.001, 0.499, 3)
+        baseline_form.addRow("Асимметрия", self.asymmetry_spin)
+        self.iterations_spin = QSpinBox()
+        self.iterations_spin.setRange(1, 100)
+        self.iterations_spin.setValue(12)
+        baseline_form.addRow("Итерации", self.iterations_spin)
+        baseline_layout.addLayout(baseline_form)
+        apply_button = QPushButton("Применить baseline")
+        apply_button.clicked.connect(self._apply_baseline)
+        baseline_layout.addWidget(apply_button)
+        self.baseline_box.setEnabled(False)
+        layout.addWidget(self.baseline_box)
+        layout.addStretch()
+        scroll.setWidget(root)
+        return scroll
 
     def _work_area(self) -> QWidget:
-        workspace = QWidget()
-        workspace.setObjectName("workspace")
+        workspace = QWidget(objectName="workspace")
         layout = QVBoxLayout(workspace)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
-
         self.table.setObjectName("mode_table")
-        self.table.setHorizontalHeaderLabels(["Мода", "Частота, см⁻¹", "ИК, KM/mol", "Raman, Å⁴/amu"])
+        self.table.setHorizontalHeaderLabels(["Мода", "Частота, см⁻¹", "ИК, KM/mol", "Raman, Å⁴/amu", "Depol. P", "Depol. U"])
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
@@ -297,127 +345,158 @@ class MainWindow(QMainWindow):
         self.table.setMinimumHeight(205)
         self.table.itemSelectionChanged.connect(self._table_selection_changed)
         table_box = QGroupBox("Колебательные моды")
-        table_box.setObjectName("data_group")
         table_layout = QVBoxLayout(table_box)
         table_layout.setContentsMargins(7, 18, 7, 7)
         table_layout.addWidget(self.table)
         layout.addWidget(table_box)
-
-        graph_frame = QGroupBox("Спектр")
-        graph_frame.setObjectName("graph_frame")
-        graph_layout = QVBoxLayout(graph_frame)
+        graph_box = QGroupBox("Спектр")
+        graph_layout = QVBoxLayout(graph_box)
         graph_layout.setContentsMargins(7, 18, 7, 7)
         graph_layout.addWidget(self.preview)
-        layout.addWidget(graph_frame, 1)
+        layout.addWidget(graph_box, 1)
         self.preview.peak_selected.connect(self._select_mode)
         return workspace
 
     def _actions_panel(self) -> QWidget:
         panel = QGroupBox("Действия")
-        panel.setObjectName("panel")
         panel.setMinimumWidth(205)
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(12, 18, 12, 12)
         layout.setSpacing(8)
-        self.open_log_button = QPushButton("Открыть Gaussian log")
-        self.open_log_button.setObjectName("primary")
-        self.open_log_button.clicked.connect(self._open_gaussian_log)
-        layout.addWidget(self.open_log_button)
-        button = QPushButton("Обновить график")
-        button.clicked.connect(self.preview.update)
-        layout.addWidget(button)
-        for text in ("Импортировать XY", "Экспорт графика", "Сохранить проект"):
-            action = QPushButton(text)
-            action.setEnabled(False)
-            layout.addWidget(action)
-        layout.addWidget(self._divider())
-        layout.addWidget(self._field_label("Состояние"))
-        self.status_label = QLabel("Файл не выбран")
-        self.status_label.setObjectName("status")
+        gaussian_button = QPushButton("Открыть Gaussian log")
+        gaussian_button.setObjectName("primary")
+        gaussian_button.clicked.connect(self._open_gaussian_log)
+        layout.addWidget(gaussian_button)
+        experimental_button = QPushButton("Импортировать XY")
+        experimental_button.clicked.connect(self._open_experimental)
+        layout.addWidget(experimental_button)
+        refresh_button = QPushButton("Обновить график")
+        refresh_button.clicked.connect(self._refresh_preview)
+        layout.addWidget(refresh_button)
+        for text in ("Экспорт графика", "Сохранить проект"):
+            button = QPushButton(text)
+            button.setEnabled(False)
+            layout.addWidget(button)
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        layout.addWidget(line)
+        layout.addWidget(QLabel("СОСТОЯНИЕ", objectName="field_label"))
+        self.status_label = QLabel("Файлы не выбраны", objectName="status")
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
         layout.addStretch()
         return panel
 
-    @staticmethod
-    def _divider() -> QFrame:
-        line = QFrame()
-        line.setFrameShape(QFrame.Shape.HLine)
-        line.setObjectName("divider")
-        return line
+    def _on_kind_changed(self) -> None:
+        self.raman_box.setEnabled(self.raman_radio.isChecked())
+        self._refresh_preview()
 
-    @staticmethod
-    def _field_label(text: str) -> QLabel:
-        label = QLabel(text.upper())
-        label.setObjectName("field_label")
-        return label
+    def _settings(self) -> TheoreticalSettings:
+        profile = {"Гауссовский": "gaussian", "Лоренцевский": "lorentzian", "Voigt": "voigt"}[self.profile_combo.currentText()]
+        normalization = {"Максимум = 1": "unit", "Максимум = 100": "percent", "Без нормировки": "none"}[self.normalization_combo.currentText()]
+        polarization = {"Неполяризованный": "unpolarized", "Параллельный": "parallel", "Перпендикулярный": "perpendicular"}[self.polarization_combo.currentText()]
+        return TheoreticalSettings(profile, self.width_spin.value(), self.scale_spin.value(), normalization, self.laser_spin.value(), self.temperature_spin.value(), polarization)
+
+    def _refresh_preview(self) -> None:
+        self.preview.configure(
+            "raman" if self.raman_radio.isChecked() else "ir",
+            self._settings(),
+            self.x_min_spin.value(),
+            self.x_max_spin.value(),
+            self.reverse_axis.isChecked(),
+        )
+
+    def _open_gaussian_log(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Открыть Gaussian log", "", "Gaussian output (*.log *.out);;Все файлы (*)")
+        if not path:
+            return
+        try:
+            calculation = parse_gaussian_log(path)
+        except GaussianImportError as error:
+            self._show_error("Gaussian log", str(error))
+            return
+        self.calculation = calculation
+        self.modes = list(calculation.modes)
+        self.preview.set_modes(self.modes)
+        self._populate_table()
+        self._select_mode(0)
+        self._update_status(f"Gaussian: {Path(path).name}\n{len(self.modes)} мод")
+
+    def _open_experimental(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Импортировать экспериментальный спектр", "", "Спектры (*.csv *.txt *.xy);;Все файлы (*)")
+        if not path:
+            return
+        try:
+            self.experimental = parse_experimental_file(path)
+        except ExperimentalImportError as error:
+            self._show_error("Экспериментальный спектр", str(error))
+            return
+        self.preview.set_experimental(self.experimental)
+        self.baseline_box.setEnabled(True)
+        if not self.modes:
+            self.x_min_spin.setValue(float(self.experimental.x.min()))
+            self.x_max_spin.setValue(float(self.experimental.x.max()))
+        self._apply_baseline()
+        self._update_status(f"Эксперимент: {Path(path).name}\n{len(self.experimental.x)} точек")
+
+    def _apply_baseline(self) -> None:
+        if self.experimental is None:
+            return
+        method = {"ALS": "als", "airPLS": "airpls", "Линейный": "linear", "Полином 2-й степени": "polynomial"}[self.baseline_method.currentText()]
+        try:
+            self.baseline = estimate_baseline(
+                self.experimental.x, self.experimental.y, method,
+                smoothing=10.0**self.lambda_spin.value(),
+                asymmetry=self.asymmetry_spin.value(),
+                iterations=self.iterations_spin.value(),
+            )
+        except (ValueError, np.linalg.LinAlgError) as error:
+            self._show_error("Baseline-коррекция", str(error))
+            return
+        self.preview.set_baseline(self.baseline)
+        self.statusBar().showMessage(f"Baseline: {self.baseline.method}")
 
     def _populate_table(self) -> None:
         self.table.setRowCount(len(self.modes))
         self.table.clearContents()
         for row, mode in enumerate(self.modes):
-            values = (str(mode.number), f"{mode.frequency:.4f}", f"{mode.ir_intensity:.4f}", f"{mode.raman_activity:.4f}")
+            values = (
+                str(mode.number), f"{mode.frequency:.4f}", f"{mode.ir_intensity:.4f}", f"{mode.raman_activity:.4f}",
+                "—" if mode.depolarization_p is None else f"{mode.depolarization_p:.4f}",
+                "—" if mode.depolarization_u is None else f"{mode.depolarization_u:.4f}",
+            )
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self.table.setItem(row, column, item)
         header = self.table.horizontalHeader()
         header.setStretchLastSection(True)
-        for column in range(3):
+        for column in range(5):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
-        if self.modes:
-            self.table.selectRow(min(4, len(self.modes) - 1))
 
     def _select_mode(self, row: int) -> None:
-        if not self.modes:
-            return
-        row = max(0, min(row, len(self.modes) - 1))
-        self.table.selectRow(row)
-        self.preview.select_peak(row)
+        if self.modes:
+            row = max(0, min(row, len(self.modes) - 1))
+            self.table.selectRow(row)
+            self.preview.select_peak(row)
 
     def _table_selection_changed(self) -> None:
         rows = self.table.selectionModel().selectedRows()
         if rows:
             self.preview.select_peak(rows[0].row())
 
-    def _open_gaussian_log(self) -> None:
-        selected_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Открыть Gaussian log",
-            "",
-            "Gaussian output (*.log *.out);;Все файлы (*)",
-        )
-        if not selected_path:
-            return
-        try:
-            calculation = parse_gaussian_log(selected_path)
-        except GaussianImportError as error:
-            self.status_label.setText("Импорт не выполнен")
-            self.statusBar().showMessage("Ошибка импорта Gaussian")
-            QMessageBox.critical(self, "Gaussian log", str(error))
-            return
+    def _update_status(self, latest: str) -> None:
+        items = []
+        if self.calculation is not None:
+            items.append(f"Gaussian: {self.calculation.source.name}\n{len(self.modes)} мод")
+        if self.experimental is not None:
+            items.append(f"Эксперимент: {self.experimental.source.name}\n{len(self.experimental.x)} точек")
+        self.status_label.setText("\n\n".join(items) if items else latest)
+        self.statusBar().showMessage(latest.replace("\n", "; "))
 
-        self.calculation = calculation
-        self.modes = list(calculation.modes)
-        self.preview.set_modes(self.modes)
-        self._populate_table()
-        self._select_mode(0)
-        summary = f"{Path(selected_path).name}\n{len(self.modes)} мод"
-        if calculation.route:
-            summary += f"\n{calculation.route.removeprefix('# ').split()[0]}"
-        self.status_label.setText(summary)
-        self.statusBar().showMessage(f"Загружено: {Path(selected_path).name}; мод: {len(self.modes)}")
-
-    def _animate_workspace(self) -> None:
-        effect = QGraphicsOpacityEffect(self.preview)
-        self.preview.setGraphicsEffect(effect)
-        animation = QPropertyAnimation(effect, b"opacity", self)
-        animation.setDuration(480)
-        animation.setStartValue(0.0)
-        animation.setEndValue(1.0)
-        animation.setEasingCurve(QEasingCurve.Type.OutCubic)
-        animation.start()
-        self._intro_animation = animation
+    def _show_error(self, title: str, message: str) -> None:
+        self.statusBar().showMessage(f"Ошибка: {message}")
+        QMessageBox.critical(self, title, message)
 
 
 STYLE = """
@@ -429,28 +508,22 @@ QMenuBar::item:selected, QMenu::item:selected { background: #d9e7f3; }
 QMenu { background: #f7f7f7; border: 1px solid #8f8f8f; }
 QGroupBox { background: #f6f6f6; border: 1px solid #a9a9a9; margin-top: 8px; padding-top: 7px; font-weight: bold; }
 QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 3px; color: #1f1f1f; }
-#panel { min-width: 205px; }
+#control_scroll { border: none; background: transparent; min-width: 270px; }
+#control_scroll > QWidget > QWidget { background: #e8e8e8; }
 #workspace { background: transparent; }
 #field_label { color: #505050; font-size: 10px; font-weight: bold; margin-top: 3px; }
-#divider { color: #c5c5c5; margin: 3px 0; }
 QRadioButton { spacing: 6px; }
 QRadioButton::indicator { width: 12px; height: 12px; border: 1px solid #717171; border-radius: 6px; background: white; }
 QRadioButton::indicator:checked { background: #1f5b8c; border: 3px solid #ffffff; outline: 1px solid #1f5b8c; }
 QComboBox, QSpinBox, QDoubleSpinBox { background: #ffffff; border: 1px solid #949494; border-radius: 1px; padding: 3px 5px; min-height: 18px; }
-QComboBox:hover, QSpinBox:hover { border-color: #3d6f99; }
-QSlider::groove:horizontal { background: #c9c9c9; height: 4px; }
-QSlider::handle:horizontal { background: #1f5b8c; border: 1px solid #174666; width: 10px; margin: -4px 0; }
-#control_value { min-width: 23px; color: #1f5b8c; font-weight: bold; }
-#hint { color: #3f3f3f; background: #eeeeee; border: 1px solid #c5c5c5; padding: 7px; }
+QComboBox:hover, QSpinBox:hover, QDoubleSpinBox:hover { border-color: #3d6f99; }
 #mode_table { background: #ffffff; border: 1px solid #9c9c9c; gridline-color: #dddddd; selection-background-color: #cfe1f0; selection-color: #161616; }
 #mode_table::item { padding: 5px; }
 QHeaderView::section { background: #e6e6e6; color: #202020; border: none; border-right: 1px solid #b8b8b8; border-bottom: 1px solid #969696; padding: 5px; font-size: 11px; font-weight: bold; }
-#graph_frame { background: #f6f6f6; }
 QPushButton { text-align: left; background: #f9f9f9; border: 1px solid #8f8f8f; border-radius: 1px; padding: 6px 8px; min-height: 18px; }
 QPushButton:hover:enabled { background: #dceaf5; border-color: #3f6f98; }
 QPushButton:disabled { color: #8b8b8b; background: #eeeeee; border-color: #c7c7c7; }
 QPushButton#primary { text-align: center; background: #e4edf5; border-color: #557d9f; color: #172d41; font-weight: bold; }
-QPushButton#primary:hover { background: #cfe1f0; }
 #status { color: #323232; background: #ffffff; border: 1px solid #adadad; padding: 6px; }
 QStatusBar { background: #f2f2f2; border-top: 1px solid #b3b3b3; color: #3b3b3b; }
 QToolTip { background: #ffffdc; color: #202020; border: 1px solid #707070; padding: 4px; }

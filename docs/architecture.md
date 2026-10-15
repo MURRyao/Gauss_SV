@@ -10,17 +10,21 @@ Gaussian Spectra преобразует результаты колебател�
 | --- | --- |
 | `spectra_app.py` | Окно PySide6, выбор файла, отображение таблицы и графика. |
 | `gaussian_parser.py` | Валидация финального статуса Gaussian и извлечение частотных блоков. |
-| `tests/test_gaussian_parser.py` | Модульные проверки контракта парсера. |
+| `experimental_parser.py` | Чтение двухколоночных экспериментальных спектров. |
+| `spectrum_processing.py` | Уширение линий, относительный Raman-вес и baseline-коррекция. |
+| `tests/` | Модульные проверки парсеров и численных алгоритмов. |
 | `docs/` | Техническая документация и процедура верификации. |
 
 ## Поток данных
 
 ```text
-Gaussian .log/.out → gaussian_parser → GaussianCalculation → таблица мод + SpectrumPreview
+Gaussian .log/.out → gaussian_parser → GaussianCalculation ┐
+                                                            ├→ SpectrumPreview
+experimental .csv/.txt/.xy → experimental_parser → baseline ┘
 ```
 
-`GaussianCalculation` содержит источник, маршрут расчёта, заголовок и упорядоченный набор `VibrationalMode`. Каждая мода имеет частоту в см⁻¹, ИК-интенсивность в KM/mol и Raman activity в Å⁴/amu, как они напечатаны Gaussian.
+`GaussianCalculation` содержит источник, маршрут расчёта, заголовок и упорядоченный набор `VibrationalMode`. Каждая мода имеет частоту в см⁻¹, ИК-интенсивность в KM/mol, Raman activity в Å⁴/amu и, если он есть в выводе Gaussian, коэффициент деполяризации.
 
 ## Границы ответственности
 
-Парсер не интерпретирует бинарные `.chk`-файлы, не применяет масштабный коэффициент частот и не выполняет baseline-коррекцию. Эти операции относятся к последующим слоям обработки и должны работать уже с валидированным набором мод.
+Парсер не интерпретирует бинарные `.chk`-файлы. Масштабирование частот, уширение, Raman-поправка и baseline-коррекция изолированы в слое `spectrum_processing.py`, чтобы их настройки не изменяли исходные результаты Gaussian.

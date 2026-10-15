@@ -15,6 +15,8 @@ NUMBER = re.compile(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[DdEe][-+]?\d+)?")
 FREQUENCIES = re.compile(r"^\s*Frequencies\s+--\s*(.+?)\s*$")
 IR_INTENSITIES = re.compile(r"^\s*IR Inten\s+--\s*(.+?)\s*$")
 RAMAN_ACTIVITIES = re.compile(r"^\s*Raman Activ\s+--\s*(.+?)\s*$")
+DEPOLARIZATION_P = re.compile(r"^\s*Depolar \(P\)\s+--\s*(.+?)\s*$")
+DEPOLARIZATION_U = re.compile(r"^\s*Depolar \(U\)\s+--\s*(.+?)\s*$")
 TERMINATION = re.compile(r"^\s*(Normal|Error) termination of Gaussian\b", re.MULTILINE)
 
 
@@ -30,6 +32,8 @@ class VibrationalMode:
     frequency: float
     ir_intensity: float
     raman_activity: float
+    depolarization_p: float | None = None
+    depolarization_u: float | None = None
 
 
 @dataclass(frozen=True)
@@ -85,18 +89,26 @@ def parse_gaussian_text(text: str, source: Path | str = Path("<memory>")) -> Gau
     frequencies: list[float] | None = None
     ir_intensities: list[float] | None = None
     raman_activities: list[float] | None = None
+    depolarization_p: list[float] | None = None
+    depolarization_u: list[float] | None = None
 
     def append_group() -> None:
-        nonlocal frequencies, ir_intensities, raman_activities
+        nonlocal frequencies, ir_intensities, raman_activities, depolarization_p, depolarization_u
         if frequencies is None:
             return
         if ir_intensities is None or raman_activities is None:
             raise GaussianImportError("Найдена неполная группа частот: отсутствуют ИК- или Raman-интенсивности.")
         if not (len(frequencies) == len(ir_intensities) == len(raman_activities)):
             raise GaussianImportError("Число частот и интенсивностей в группе Gaussian не совпадает.")
-        for frequency, ir_intensity, raman_activity in zip(frequencies, ir_intensities, raman_activities):
-            modes.append(VibrationalMode(len(modes) + 1, frequency, ir_intensity, raman_activity))
-        frequencies = ir_intensities = raman_activities = None
+        if depolarization_p is not None and len(depolarization_p) != len(frequencies):
+            raise GaussianImportError("Число коэффициентов Depolar (P) не совпадает с числом частот.")
+        if depolarization_u is not None and len(depolarization_u) != len(frequencies):
+            raise GaussianImportError("Число коэффициентов Depolar (U) не совпадает с числом частот.")
+        for index, (frequency, ir_intensity, raman_activity) in enumerate(zip(frequencies, ir_intensities, raman_activities)):
+            p_value = depolarization_p[index] if depolarization_p is not None else None
+            u_value = depolarization_u[index] if depolarization_u is not None else None
+            modes.append(VibrationalMode(len(modes) + 1, frequency, ir_intensity, raman_activity, p_value, u_value))
+        frequencies = ir_intensities = raman_activities = depolarization_p = depolarization_u = None
 
     for line in lines:
         match = FREQUENCIES.match(line)
@@ -111,7 +123,14 @@ def parse_gaussian_text(text: str, source: Path | str = Path("<memory>")) -> Gau
         match = RAMAN_ACTIVITIES.match(line)
         if match and frequencies is not None:
             raman_activities = _numbers(match.group(1))
-            append_group()
+            continue
+        match = DEPOLARIZATION_P.match(line)
+        if match and frequencies is not None:
+            depolarization_p = _numbers(match.group(1))
+            continue
+        match = DEPOLARIZATION_U.match(line)
+        if match and frequencies is not None:
+            depolarization_u = _numbers(match.group(1))
 
     append_group()
     if not modes:

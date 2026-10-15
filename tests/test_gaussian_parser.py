@@ -11,6 +11,8 @@ water
  Frequencies --   100.0000               200.0000               300.0000
  IR Inten    --     1.0000                 2.0000                 3.0000
  Raman Activ --     4.0000                 5.0000                 6.0000
+ Depolar (P) --     0.1000                 0.2000                 0.3000
+ Depolar (U) --     0.2000                 0.3000                 0.4000
  Normal termination of Gaussian 09
 """
 
@@ -24,6 +26,7 @@ class GaussianParserTests(unittest.TestCase):
         self.assertEqual(calculation.modes[1].frequency, 200.0)
         self.assertEqual(calculation.modes[2].ir_intensity, 3.0)
         self.assertEqual(calculation.modes[0].raman_activity, 4.0)
+        self.assertEqual(calculation.modes[2].depolarization_p, 0.3)
 
     def test_rejects_unfinished_log(self):
         with self.assertRaisesRegex(GaussianImportError, "Normal termination"):

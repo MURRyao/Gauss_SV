@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 
 from experimental_parser import ExperimentalImportError, ExperimentalSpectrum, parse_experimental_file
 from gaussian_parser import GaussianCalculation, GaussianImportError, VibrationalMode, parse_gaussian_log
+from project_io import ProjectFormatError, load_project as read_project, save_project as write_project
 from spectrum_processing import BaselineResult, TheoreticalSettings, calculate_theoretical_spectrum, estimate_baseline
 
 
@@ -201,6 +202,7 @@ class MainWindow(QMainWindow):
         self.table = QTableWidget(0, 6)
         self._build_ui()
         self._refresh_preview()
+        self._sync_actions()
 
     def _build_ui(self) -> None:
         self._build_menu()
@@ -221,12 +223,20 @@ class MainWindow(QMainWindow):
         file_menu = self.menuBar().addMenu("Файл")
         file_menu.addAction("Открыть Gaussian log…", self._open_gaussian_log)
         file_menu.addAction("Импортировать экспериментальный спектр…", self._open_experimental)
+        file_menu.addAction("Открыть проект…", self._open_project)
+        self.menu_save_project = file_menu.addAction("Сохранить проект…", self._save_project_dialog)
         file_menu.addSeparator()
         file_menu.addAction("Выход", self.close)
-        self.menuBar().addMenu("Спектр")
+
+        spectrum_menu = self.menuBar().addMenu("Спектр")
+        self.menu_export_graph = spectrum_menu.addAction("Экспортировать график…", self._export_graph_dialog)
+        spectrum_menu.addAction("Сбросить параметры спектра", self._reset_spectrum_settings)
+        self.menu_clear_experimental = spectrum_menu.addAction("Убрать экспериментальный спектр", self._clear_experimental)
         view_menu = self.menuBar().addMenu("Вид")
         view_menu.addAction("Сбросить выделение", lambda: self._select_mode(0))
-        self.menuBar().addMenu("Справка")
+        help_menu = self.menuBar().addMenu("Справка")
+        help_menu.addAction("Краткое руководство", self._show_quick_help)
+        help_menu.addAction("О программе", self._show_about)
 
     @staticmethod
     def _double(value: float, low: float, high: float, decimals: int = 2) -> QDoubleSpinBox:
@@ -373,10 +383,12 @@ class MainWindow(QMainWindow):
         refresh_button = QPushButton("Обновить график")
         refresh_button.clicked.connect(self._refresh_preview)
         layout.addWidget(refresh_button)
-        for text in ("Экспорт графика", "Сохранить проект"):
-            button = QPushButton(text)
-            button.setEnabled(False)
-            layout.addWidget(button)
+        self.export_button = QPushButton("Экспорт графика")
+        self.export_button.clicked.connect(self._export_graph_dialog)
+        layout.addWidget(self.export_button)
+        self.save_project_button = QPushButton("Сохранить проект")
+        self.save_project_button.clicked.connect(self._save_project_dialog)
+        layout.addWidget(self.save_project_button)
         line = QFrame()
         line.setFrameShape(QFrame.Shape.HLine)
         layout.addWidget(line)
@@ -406,6 +418,31 @@ class MainWindow(QMainWindow):
             self.reverse_axis.isChecked(),
         )
 
+    def _sync_actions(self) -> None:
+        has_data = bool(self.modes) or self.experimental is not None
+        self.export_button.setEnabled(has_data)
+        self.save_project_button.setEnabled(has_data)
+        self.menu_export_graph.setEnabled(has_data)
+        self.menu_save_project.setEnabled(has_data)
+        self.menu_clear_experimental.setEnabled(self.experimental is not None)
+
+    def _set_calculation(self, calculation: GaussianCalculation | None) -> None:
+        self.calculation = calculation
+        self.modes = list(calculation.modes) if calculation is not None else []
+        self.preview.set_modes(self.modes)
+        self._populate_table()
+        if self.modes:
+            self._select_mode(0)
+        self._sync_actions()
+
+    def _set_experimental(self, spectrum: ExperimentalSpectrum | None) -> None:
+        self.experimental = spectrum
+        self.baseline = None
+        self.preview.set_experimental(spectrum)
+        self.preview.set_baseline(None)
+        self.baseline_box.setEnabled(spectrum is not None)
+        self._sync_actions()
+
     def _open_gaussian_log(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Открыть Gaussian log", "", "Gaussian output (*.log *.out);;Все файлы (*)")
         if not path:
@@ -415,11 +452,7 @@ class MainWindow(QMainWindow):
         except GaussianImportError as error:
             self._show_error("Gaussian log", str(error))
             return
-        self.calculation = calculation
-        self.modes = list(calculation.modes)
-        self.preview.set_modes(self.modes)
-        self._populate_table()
-        self._select_mode(0)
+        self._set_calculation(calculation)
         self._update_status(f"Gaussian: {Path(path).name}\n{len(self.modes)} мод")
 
     def _open_experimental(self) -> None:
@@ -427,17 +460,153 @@ class MainWindow(QMainWindow):
         if not path:
             return
         try:
-            self.experimental = parse_experimental_file(path)
+            spectrum = parse_experimental_file(path)
         except ExperimentalImportError as error:
             self._show_error("Экспериментальный спектр", str(error))
             return
-        self.preview.set_experimental(self.experimental)
-        self.baseline_box.setEnabled(True)
+        self._set_experimental(spectrum)
         if not self.modes:
             self.x_min_spin.setValue(float(self.experimental.x.min()))
             self.x_max_spin.setValue(float(self.experimental.x.max()))
         self._apply_baseline()
         self._update_status(f"Эксперимент: {Path(path).name}\n{len(self.experimental.x)} точек")
+
+    def _project_settings(self) -> dict[str, object]:
+        return {
+            "kind": "raman" if self.raman_radio.isChecked() else "ir",
+            "profile": self.profile_combo.currentText(),
+            "width": self.width_spin.value(),
+            "frequency_scale": self.scale_spin.value(),
+            "normalization": self.normalization_combo.currentText(),
+            "x_min": self.x_min_spin.value(),
+            "x_max": self.x_max_spin.value(),
+            "reverse_x": self.reverse_axis.isChecked(),
+            "laser_nm": self.laser_spin.value(),
+            "temperature_k": self.temperature_spin.value(),
+            "polarization": self.polarization_combo.currentText(),
+            "baseline_method": self.baseline_method.currentText(),
+            "baseline_lambda_power": self.lambda_spin.value(),
+            "baseline_asymmetry": self.asymmetry_spin.value(),
+            "baseline_iterations": self.iterations_spin.value(),
+        }
+
+    @staticmethod
+    def _restore_combo(combo: QComboBox, value: object) -> None:
+        if isinstance(value, str):
+            index = combo.findText(value)
+            if index >= 0:
+                combo.setCurrentIndex(index)
+
+    @staticmethod
+    def _restore_spin(spin: QDoubleSpinBox | QSpinBox, value: object) -> None:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            spin.setValue(int(value) if isinstance(spin, QSpinBox) else float(value))
+
+    def _restore_project_settings(self, settings: dict[str, object]) -> None:
+        self.raman_radio.setChecked(settings.get("kind") != "ir")
+        self._restore_combo(self.profile_combo, settings.get("profile"))
+        self._restore_spin(self.width_spin, settings.get("width"))
+        self._restore_spin(self.scale_spin, settings.get("frequency_scale"))
+        self._restore_combo(self.normalization_combo, settings.get("normalization"))
+        self._restore_spin(self.x_min_spin, settings.get("x_min"))
+        self._restore_spin(self.x_max_spin, settings.get("x_max"))
+        self.reverse_axis.setChecked(settings.get("reverse_x") is True)
+        self._restore_spin(self.laser_spin, settings.get("laser_nm"))
+        self._restore_spin(self.temperature_spin, settings.get("temperature_k"))
+        self._restore_combo(self.polarization_combo, settings.get("polarization"))
+        self._restore_combo(self.baseline_method, settings.get("baseline_method"))
+        self._restore_spin(self.lambda_spin, settings.get("baseline_lambda_power"))
+        self._restore_spin(self.asymmetry_spin, settings.get("baseline_asymmetry"))
+        self._restore_spin(self.iterations_spin, settings.get("baseline_iterations"))
+        self._refresh_preview()
+
+    def save_project(self, path: str | Path) -> None:
+        """Persist the imported data and current UI state as a JSON project."""
+
+        write_project(path, self.calculation, self.experimental, self._project_settings())
+
+    def load_project(self, path: str | Path) -> None:
+        """Restore a saved project without requiring its original source files."""
+
+        state = read_project(path)
+        self._set_calculation(state.calculation)
+        self._set_experimental(state.experimental)
+        self._restore_project_settings(state.settings)
+        if self.experimental is not None:
+            self._apply_baseline()
+        self._update_status(f"Проект: {Path(path).name}")
+
+    def export_graph(self, path: str | Path) -> None:
+        """Write the currently visible spectrum plot to a raster image."""
+
+        target = Path(path)
+        if not target.suffix:
+            target = target.with_suffix(".png")
+        image = self.preview.grab()
+        if image.isNull() or not image.save(str(target)):
+            raise OSError(f"Не удалось сохранить изображение: {target}")
+
+    def _save_project_dialog(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(self, "Сохранить проект", "spectrum-project.json", "Проект Gaussian Spectra (*.json)")
+        if not path:
+            return
+        target = Path(path)
+        if not target.suffix:
+            target = target.with_suffix(".json")
+        try:
+            self.save_project(target)
+        except ProjectFormatError as error:
+            self._show_error("Сохранение проекта", str(error))
+            return
+        self.statusBar().showMessage(f"Проект сохранён: {target.name}")
+
+    def _open_project(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Открыть проект", "", "Проект Gaussian Spectra (*.json);;Все файлы (*)")
+        if not path:
+            return
+        try:
+            self.load_project(path)
+        except ProjectFormatError as error:
+            self._show_error("Открытие проекта", str(error))
+
+    def _export_graph_dialog(self) -> None:
+        path, selected_filter = QFileDialog.getSaveFileName(self, "Экспортировать график", "spectrum.png", "PNG (*.png);;JPEG (*.jpg *.jpeg)")
+        if not path:
+            return
+        target = Path(path)
+        if not target.suffix:
+            target = target.with_suffix(".jpg" if "JPEG" in selected_filter else ".png")
+        try:
+            self.export_graph(target)
+        except OSError as error:
+            self._show_error("Экспорт графика", str(error))
+            return
+        self.statusBar().showMessage(f"График экспортирован: {target.name}")
+
+    def _clear_experimental(self) -> None:
+        self._set_experimental(None)
+        self._update_status("Экспериментальный спектр удалён")
+
+    def _reset_spectrum_settings(self) -> None:
+        self.raman_radio.setChecked(True)
+        self.profile_combo.setCurrentText("Гауссовский")
+        self.width_spin.setValue(18.0)
+        self.scale_spin.setValue(1.0)
+        self.normalization_combo.setCurrentText("Максимум = 1")
+        self.x_min_spin.setValue(0.0)
+        self.x_max_spin.setValue(4000.0)
+        self.reverse_axis.setChecked(False)
+        self.laser_spin.setValue(514.5)
+        self.temperature_spin.setValue(300.0)
+        self.polarization_combo.setCurrentText("Неполяризованный")
+        self._refresh_preview()
+        self.statusBar().showMessage("Параметры спектра сброшены")
+
+    def _show_quick_help(self) -> None:
+        QMessageBox.information(self, "Краткое руководство", "1. Откройте Gaussian log или импортируйте XY.\n2. Настройте контур и диапазон спектра.\n3. Для XY выберите baseline и нажмите «Применить baseline».\n4. Экспортируйте график или сохраните проект в JSON.")
+
+    def _show_about(self) -> None:
+        QMessageBox.information(self, "О программе", "Gaussian Spectra\nВизуализация и сопоставление ИК/Raman-спектров Gaussian с экспериментальными данными.")
 
     def _apply_baseline(self) -> None:
         if self.experimental is None:

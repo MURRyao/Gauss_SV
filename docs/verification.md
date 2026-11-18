@@ -6,11 +6,13 @@
 
 ```bash
 python3 -m unittest discover -s tests -v
-python3 -m py_compile spectra_app.py gaussian_parser.py experimental_parser.py spectrum_processing.py
+python3 -m py_compile spectra_app.py gaussian_parser.py experimental_parser.py spectrum_processing.py project_io.py
 QT_QPA_PLATFORM=offscreen python3 spectra_app.py --smoke-test
 ```
 
 Первый запуск проверяет извлечение полного блока мод и отказ при незавершённом или ошибочном Gaussian-задании. Последние две команды проверяют синтаксис и создание окна без графического дисплея.
+
+Интеграционная проверка открывает `tests/fixtures/water.log` и `tests/fixtures/experimental.csv`, применяет baseline-коррекцию, экспортирует PNG и убеждается, что JSON-проект можно восстановить в новом окне.
 
 ## Контрольный файл
 
